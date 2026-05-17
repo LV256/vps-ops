@@ -12,7 +12,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass python3-pip
           pip3 install tencentcloud-sdk-python --quiet
 
-      - name: Allocate and bind new EIP + restart SS
+      - name: Allocate+bind+restart
         env:
           TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
           TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
@@ -23,54 +23,64 @@ jobs:
           from tencentcloud.common import credential
           from tencentcloud.vpc.v20170312 import vpc_client, models as vpc_models
 
-          secret_id = os.environ["TENCENT_SECRET_ID"]
-          secret_key = os.environ["TENCENT_SECRET_KEY"]
+          sid = os.environ["TENCENT_SECRET_ID"]
+          skey = os.environ["TENCENT_SECRET_KEY"]
           vps_pass = os.environ["VPS_PASS"]
-          cred = credential.Credential(secret_id, secret_key)
+          cred = credential.Credential(sid, skey)
           region = "ap-seoul"
           instance_id = "ins-2rolbm5x"
           vpc = vpc_client.VpcClient(cred, region)
 
+          # Allocate
           print("=== Allocating new EIP ===", flush=True)
-          alloc_req = vpc_models.AllocateAddressesRequest()
-          alloc_req.AddressCount = 1
-          alloc_req.InternetChargeType = "TRAFFIC_POSTPAID_BY_HOUR"
-          alloc_resp = vpc.AllocateAddresses(alloc_req)
-          alloc_data = json.loads(alloc_resp.to_json_string())
-          new_ip = alloc_data["AddressSet"][0]["AddressIp"]
-          new_eip_id = alloc_data["AddressSet"][0]["AddressId"]
+          req = vpc_models.AllocateAddressesRequest()
+          req.AddressCount = 1
+          req.InternetChargeType = "TRAFFIC_POSTPAID_BY_HOUR"
+          resp = vpc.AllocateAddresses(req)
+          raw = resp.to_json_string()
+          print("Raw:", raw[:300], flush=True)
+          data = json.loads(raw)
+          # Handle both possible structures
+          body = data.get("Response", data)
+          addrs = body.get("AddressSet", [])
+          new_ip = addrs[0]["AddressIp"]
+          new_eip_id = addrs[0]["AddressId"]
           print(f"New EIP: {new_eip_id} -> {new_ip}", flush=True)
 
+          # Associate
           print(f"=== Binding to {instance_id} ===", flush=True)
-          assoc_req = vpc_models.AssociateAddressRequest()
-          assoc_req.AddressId = new_eip_id
-          assoc_req.InstanceId = instance_id
-          vpc.AssociateAddress(assoc_req)
+          areq = vpc_models.AssociateAddressRequest()
+          areq.AddressId = new_eip_id
+          areq.InstanceId = instance_id
+          vpc.AssociateAddress(areq)
           print("Bound!", flush=True)
 
-          print(f"=== Waiting for SSH ===", flush=True)
-          time.sleep(20)
-          
+          # Wait + SSH
+          print("=== Waiting for SSH (up to 90s) ===", flush=True)
+          time.sleep(15)
           with open("/tmp/vps_pass", "w") as f:
               f.write(vps_pass)
-          
-          for i in range(1, 15):
-              result = subprocess.run([
+
+          ok = False
+          for i in range(1, 16):
+              r = subprocess.run([
                   "sshpass", "-f", "/tmp/vps_pass", "ssh",
                   "-o", "StrictHostKeyChecking=accept-new",
                   "-o", "ConnectTimeout=5",
                   f"ubuntu@{new_ip}", "echo OK"
               ], capture_output=True, text=True)
-              if result.returncode == 0:
+              if r.returncode == 0:
                   print(f"SSH OK after {i*5}s", flush=True)
+                  ok = True
                   break
               print(f"Waiting... ({i*5}s)", flush=True)
               time.sleep(5)
-          else:
+          if not ok:
               print("ERROR: SSH never came up", flush=True)
               sys.exit(1)
 
-          print(f"=== Restarting SS ===", flush=True)
+          # Restart SS
+          print("=== Restarting SS ===", flush=True)
           cmds = [
               "sudo pkill -9 ss-server 2>/dev/null || true",
               "sleep 1",

@@ -1,0 +1,21 @@
+name: Restart SS on VPS
+on:
+  workflow_dispatch:
+jobs:
+  restart:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restart
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          echo "${{ secrets.VPS_PASSWORD }}" > /tmp/vps_pass
+          sshpass -f /tmp/vps_pass ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 ubuntu@43.155.199.131 '
+            sudo pkill -9 ss-server 2>/dev/null || true
+            sleep 1
+            sudo systemctl reset-failed shadowsocks-libev 2>/dev/null || true
+            sudo systemctl start shadowsocks-libev
+            sleep 1
+            sudo systemctl status shadowsocks-libev --no-pager | head -5
+            sudo ss -tlnp | grep 3456
+          '
+          rm -f /tmp/vps_pass

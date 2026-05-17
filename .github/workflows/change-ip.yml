@@ -7,26 +7,127 @@ jobs:
   change-ip:
     runs-on: ubuntu-latest
     steps:
-      - name: Install sshpass
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass python3-pip
+          pip3 install tencentcloud-sdk-python --quiet
 
-      - name: Get VPS metadata
+      - name: Change EIP
+        env:
+          TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
+          TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, time
+          from tencentcloud.common import credential
+          from tencentcloud.vpc.v20170312 import vpc_client, models as vpc_models
+          from tencentcloud.cvm.v20170312 import cvm_client, models as cvm_models
+
+          secret_id = os.environ["TENCENT_SECRET_ID"]
+          secret_key = os.environ["TENCENT_SECRET_KEY"]
+          cred = credential.Credential(secret_id, secret_key)
+
+          region = "ap-seoul"
+          instance_id = "ins-2rolbm5x"
+
+          # --- Step 1: Find current EIP ---
+          print("=== Step 1: Finding current EIP ===")
+          vpc = vpc_client.VpcClient(cred, region)
+          req = vpc_models.DescribeAddressesRequest()
+          resp = vpc.DescribeAddresses(req)
+          addrs = json.loads(resp.to_json_string())["AddressSet"]
+
+          eip_id = None
+          old_ip = None
+          for a in addrs:
+              if a.get("InstanceId") == instance_id:
+                  eip_id = a["AddressId"]
+                  old_ip = a["AddressIp"]
+                  print(f"Found: {eip_id} -> {old_ip}")
+                  break
+
+          if not eip_id:
+              # Check all EIPs
+              for a in addrs:
+                  print(f"  Unbound: {a['AddressId']} -> {a['AddressIp']} ({a['AddressStatus']})")
+              print("No EIP bound to instance. Looking for unbound EIPs...")
+              for a in addrs:
+                  if a["AddressStatus"] == "UNBIND":
+                      eip_id = a["AddressId"]
+                      old_ip = a["AddressIp"]
+                      break
+              if not eip_id:
+                  print("ERROR: No EIP found. Aborting.")
+                  exit(1)
+
+          # --- Step 2: Disassociate ---
+          print(f"\n=== Step 2: Disassociating {eip_id} ===")
+          dis_req = vpc_models.DisassociateAddressRequest()
+          dis_req.AddressId = eip_id
+          vpc.DisassociateAddress(dis_req)
+          print("Disassociated. Waiting 5s...")
+          time.sleep(5)
+
+          # --- Step 3: Release old EIP ---
+          print(f"\n=== Step 3: Releasing {eip_id} ===")
+          rel_req = vpc_models.ReleaseAddressesRequest()
+          rel_req.AddressIds = [eip_id]
+          vpc.ReleaseAddresses(rel_req)
+          print("Released. Waiting 3s...")
+          time.sleep(3)
+
+          # --- Step 4: Allocate new EIP ---
+          print("\n=== Step 4: Allocating new EIP ===")
+          alloc_req = vpc_models.AllocateAddressesRequest()
+          alloc_req.AddressCount = 1
+          alloc_req.InternetChargeType = "TRAFFIC_POSTPAID_BY_HOUR"
+          alloc_resp = vpc.AllocateAddresses(alloc_req)
+          alloc_data = json.loads(alloc_resp.to_json_string())
+          new_eip_id = alloc_data["AddressSet"][0]["AddressId"]
+          new_ip = alloc_data["AddressSet"][0]["AddressIp"]
+          print(f"New EIP: {new_eip_id} -> {new_ip}")
+
+          # --- Step 5: Associate to instance ---
+          print(f"\n=== Step 5: Binding to {instance_id} ===")
+          assoc_req = vpc_models.AssociateAddressRequest()
+          assoc_req.AddressId = new_eip_id
+          assoc_req.InstanceId = instance_id
+          vpc.AssociateAddress(assoc_req)
+          print("Bound! Waiting 5s for propagation...")
+          time.sleep(5)
+
+          print(f"\n=== DONE ===")
+          print(f"Old IP: {old_ip}")
+          print(f"New IP: {new_ip}")
+          PYEOF
+
+      - name: Restart SS on VPS
         env:
           VPS_PASS: ${{ secrets.VPS_PASSWORD }}
         run: |
           echo "$VPS_PASS" > /tmp/vps_pass
-          sshpass -f /tmp/vps_pass ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 ubuntu@150.109.247.58 '
-            echo "=== INSTANCE_ID ==="
-            curl -s http://metadata.tencentyun.com/latest/meta-data/instance-id 2>/dev/null || echo "N/A"
-            echo "=== REGION ==="
-            curl -s http://metadata.tencentyun.com/latest/meta-data/placement/region 2>/dev/null || echo "N/A"
-            echo "=== CURRENT_IP ==="
-            curl -s ifconfig.me 2>/dev/null || echo "N/A"
-            echo "=== TC_CLI ==="
-            which tccli 2>/dev/null && echo "YES" || echo "NO"
-            echo "=== TC_CONFIG ==="
-            cat ~/.tccli/default.credential 2>/dev/null || echo "N/A"
-            echo "=== ENV_KEYS ==="
-            env | grep -i -E "TENCENT|SECRET" 2>/dev/null || echo "N/A"
-          ' 2>&1
+          
+          # Wait for IP change to propagate
+          sleep 10
+          
+          # Get new IP from metadata
+          NEW_IP=$(sshpass -f /tmp/vps_pass ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 ubuntu@150.109.247.58 'curl -s ifconfig.me' 2>&1)
+          echo "VPS reports: $NEW_IP"
+          
+          # Restart SS
+          sshpass -f /tmp/vps_pass ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 ubuntu@$NEW_IP "
+            echo '=== Restarting SS ==='
+            sudo pkill -9 ss-server 2>/dev/null || true
+            sleep 1
+            sudo systemctl reset-failed shadowsocks-libev 2>/dev/null || true
+            sudo systemctl start shadowsocks-libev
+            sleep 1
+            sudo systemctl status shadowsocks-libev --no-pager | head -5
+            sudo ss -tlnp | grep 3456
+          "
           rm -f /tmp/vps_pass
+
+      - name: Summary
+        run: |
+          echo "New IP is bound and SS is running."
+          echo "Update Shadowrocket config to the new IP."

@@ -12,122 +12,85 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq sshpass python3-pip
           pip3 install tencentcloud-sdk-python --quiet
 
-      - name: Change EIP
+      - name: Allocate and bind new EIP + restart SS
         env:
           TENCENT_SECRET_ID: ${{ secrets.TENCENT_SECRET_ID }}
           TENCENT_SECRET_KEY: ${{ secrets.TENCENT_SECRET_KEY }}
+          VPS_PASS: ${{ secrets.VPS_PASSWORD }}
         run: |
           python3 << 'PYEOF'
-          import json, os, time
+          import json, os, time, subprocess, sys
           from tencentcloud.common import credential
           from tencentcloud.vpc.v20170312 import vpc_client, models as vpc_models
-          from tencentcloud.cvm.v20170312 import cvm_client, models as cvm_models
 
           secret_id = os.environ["TENCENT_SECRET_ID"]
           secret_key = os.environ["TENCENT_SECRET_KEY"]
+          vps_pass = os.environ["VPS_PASS"]
           cred = credential.Credential(secret_id, secret_key)
-
           region = "ap-seoul"
           instance_id = "ins-2rolbm5x"
-
-          # --- Step 1: Find current EIP ---
-          print("=== Step 1: Finding current EIP ===")
           vpc = vpc_client.VpcClient(cred, region)
-          req = vpc_models.DescribeAddressesRequest()
-          resp = vpc.DescribeAddresses(req)
-          addrs = json.loads(resp.to_json_string())["AddressSet"]
 
-          eip_id = None
-          old_ip = None
-          for a in addrs:
-              if a.get("InstanceId") == instance_id:
-                  eip_id = a["AddressId"]
-                  old_ip = a["AddressIp"]
-                  print(f"Found: {eip_id} -> {old_ip}")
-                  break
-
-          if not eip_id:
-              # Check all EIPs
-              for a in addrs:
-                  print(f"  Unbound: {a['AddressId']} -> {a['AddressIp']} ({a['AddressStatus']})")
-              print("No EIP bound to instance. Looking for unbound EIPs...")
-              for a in addrs:
-                  if a["AddressStatus"] == "UNBIND":
-                      eip_id = a["AddressId"]
-                      old_ip = a["AddressIp"]
-                      break
-              if not eip_id:
-                  print("ERROR: No EIP found. Aborting.")
-                  exit(1)
-
-          # --- Step 2: Disassociate ---
-          print(f"\n=== Step 2: Disassociating {eip_id} ===")
-          dis_req = vpc_models.DisassociateAddressRequest()
-          dis_req.AddressId = eip_id
-          vpc.DisassociateAddress(dis_req)
-          print("Disassociated. Waiting 5s...")
-          time.sleep(5)
-
-          # --- Step 3: Release old EIP ---
-          print(f"\n=== Step 3: Releasing {eip_id} ===")
-          rel_req = vpc_models.ReleaseAddressesRequest()
-          rel_req.AddressIds = [eip_id]
-          vpc.ReleaseAddresses(rel_req)
-          print("Released. Waiting 3s...")
-          time.sleep(3)
-
-          # --- Step 4: Allocate new EIP ---
-          print("\n=== Step 4: Allocating new EIP ===")
+          print("=== Allocating new EIP ===", flush=True)
           alloc_req = vpc_models.AllocateAddressesRequest()
           alloc_req.AddressCount = 1
           alloc_req.InternetChargeType = "TRAFFIC_POSTPAID_BY_HOUR"
           alloc_resp = vpc.AllocateAddresses(alloc_req)
           alloc_data = json.loads(alloc_resp.to_json_string())
-          new_eip_id = alloc_data["AddressSet"][0]["AddressId"]
           new_ip = alloc_data["AddressSet"][0]["AddressIp"]
-          print(f"New EIP: {new_eip_id} -> {new_ip}")
+          new_eip_id = alloc_data["AddressSet"][0]["AddressId"]
+          print(f"New EIP: {new_eip_id} -> {new_ip}", flush=True)
 
-          # --- Step 5: Associate to instance ---
-          print(f"\n=== Step 5: Binding to {instance_id} ===")
+          print(f"=== Binding to {instance_id} ===", flush=True)
           assoc_req = vpc_models.AssociateAddressRequest()
           assoc_req.AddressId = new_eip_id
           assoc_req.InstanceId = instance_id
           vpc.AssociateAddress(assoc_req)
-          print("Bound! Waiting 5s for propagation...")
-          time.sleep(5)
+          print("Bound!", flush=True)
 
-          print(f"\n=== DONE ===")
-          print(f"Old IP: {old_ip}")
-          print(f"New IP: {new_ip}")
+          print(f"=== Waiting for SSH ===", flush=True)
+          time.sleep(20)
+          
+          with open("/tmp/vps_pass", "w") as f:
+              f.write(vps_pass)
+          
+          for i in range(1, 15):
+              result = subprocess.run([
+                  "sshpass", "-f", "/tmp/vps_pass", "ssh",
+                  "-o", "StrictHostKeyChecking=accept-new",
+                  "-o", "ConnectTimeout=5",
+                  f"ubuntu@{new_ip}", "echo OK"
+              ], capture_output=True, text=True)
+              if result.returncode == 0:
+                  print(f"SSH OK after {i*5}s", flush=True)
+                  break
+              print(f"Waiting... ({i*5}s)", flush=True)
+              time.sleep(5)
+          else:
+              print("ERROR: SSH never came up", flush=True)
+              sys.exit(1)
+
+          print(f"=== Restarting SS ===", flush=True)
+          cmds = [
+              "sudo pkill -9 ss-server 2>/dev/null || true",
+              "sleep 1",
+              "sudo systemctl reset-failed shadowsocks-libev 2>/dev/null || true",
+              "sudo systemctl start shadowsocks-libev",
+              "sleep 1",
+              "sudo systemctl status shadowsocks-libev --no-pager | head -5",
+              "sudo ss -tlnp | grep 3456",
+          ]
+          for cmd in cmds:
+              subprocess.run([
+                  "sshpass", "-f", "/tmp/vps_pass", "ssh",
+                  "-o", "StrictHostKeyChecking=accept-new",
+                  "-o", "ConnectTimeout=10",
+                  f"ubuntu@{new_ip}", cmd
+              ])
+
+          os.unlink("/tmp/vps_pass")
+          print(f"\n{'='*50}", flush=True)
+          print(f"NEW VPS IP: {new_ip}", flush=True)
+          print(f"Shadowrocket -> {new_ip}:3456", flush=True)
+          print(f"{'='*50}", flush=True)
           PYEOF
-
-      - name: Restart SS on VPS
-        env:
-          VPS_PASS: ${{ secrets.VPS_PASSWORD }}
-        run: |
-          echo "$VPS_PASS" > /tmp/vps_pass
-          
-          # Wait for IP change to propagate
-          sleep 10
-          
-          # Get new IP from metadata
-          NEW_IP=$(sshpass -f /tmp/vps_pass ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 ubuntu@150.109.247.58 'curl -s ifconfig.me' 2>&1)
-          echo "VPS reports: $NEW_IP"
-          
-          # Restart SS
-          sshpass -f /tmp/vps_pass ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 ubuntu@$NEW_IP "
-            echo '=== Restarting SS ==='
-            sudo pkill -9 ss-server 2>/dev/null || true
-            sleep 1
-            sudo systemctl reset-failed shadowsocks-libev 2>/dev/null || true
-            sudo systemctl start shadowsocks-libev
-            sleep 1
-            sudo systemctl status shadowsocks-libev --no-pager | head -5
-            sudo ss -tlnp | grep 3456
-          "
-          rm -f /tmp/vps_pass
-
-      - name: Summary
-        run: |
-          echo "New IP is bound and SS is running."
-          echo "Update Shadowrocket config to the new IP."

@@ -43,8 +43,18 @@ jobs:
           # Handle both possible structures
           body = data.get("Response", data)
           addrs = body.get("AddressSet", [])
-          new_ip = addrs[0]["AddressIp"]
-          new_eip_id = addrs[0]["AddressId"]
+          new_eip_id = addrs[0]
+          print(f"New EIP ID: {new_eip_id}", flush=True)
+
+          # Need to DescribeAddresses to get the actual IP
+          print("=== Getting IP address ===", flush=True)
+          dreq = vpc_models.DescribeAddressesRequest()
+          dreq.AddressIds = [new_eip_id]
+          dresp = vpc.DescribeAddresses(dreq)
+          draw = dresp.to_json_string()
+          ddata = json.loads(draw)
+          dbody = ddata.get("Response", ddata)
+          new_ip = dbody["AddressSet"][0]["AddressIp"]
           print(f"New EIP: {new_eip_id} -> {new_ip}", flush=True)
 
           # Associate

@@ -1,0 +1,32 @@
+name: Change VPS IP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  change-ip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install sshpass
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+
+      - name: Get VPS metadata
+        env:
+          VPS_PASS: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          echo "$VPS_PASS" > /tmp/vps_pass
+          sshpass -f /tmp/vps_pass ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 ubuntu@150.109.247.58 '
+            echo "=== INSTANCE_ID ==="
+            curl -s http://metadata.tencentyun.com/latest/meta-data/instance-id 2>/dev/null || echo "N/A"
+            echo "=== REGION ==="
+            curl -s http://metadata.tencentyun.com/latest/meta-data/placement/region 2>/dev/null || echo "N/A"
+            echo "=== CURRENT_IP ==="
+            curl -s ifconfig.me 2>/dev/null || echo "N/A"
+            echo "=== TC_CLI ==="
+            which tccli 2>/dev/null && echo "YES" || echo "NO"
+            echo "=== TC_CONFIG ==="
+            cat ~/.tccli/default.credential 2>/dev/null || echo "N/A"
+            echo "=== ENV_KEYS ==="
+            env | grep -i -E "TENCENT|SECRET" 2>/dev/null || echo "N/A"
+          ' 2>&1
+          rm -f /tmp/vps_pass
